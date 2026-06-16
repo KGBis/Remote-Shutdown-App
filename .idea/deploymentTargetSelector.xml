@@ -7,7 +7,7 @@
         <DropdownSelection timestamp="2026-06-16T17:33:37.161480300Z">
           <Target type="DEFAULT_BOOT">
             <handle>
-              <DeviceId pluginId="PhysicalDevice" identifier="serial=4XGIC6OFKRRKZ54P" />
+              <DeviceId pluginId="LocalEmulator" identifier="path=C:\Users\Kike\.android\avd\Medium_Phone_No_Play.avd" />
             </handle>
           </Target>
         </DropdownSelection>
