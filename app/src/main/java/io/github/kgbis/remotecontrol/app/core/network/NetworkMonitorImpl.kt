@@ -24,6 +24,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED
+import android.net.NetworkCapabilities.TRANSPORT_VPN
 import android.net.NetworkCapabilities.TRANSPORT_WIFI
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.FlowPreview
@@ -43,7 +44,7 @@ class NetworkMonitorImpl(
     context: Context,
     scope: CoroutineScope,
     private val networkRangeDetector: NetworkRangeDetector
-): NetworkMonitor {
+) : NetworkMonitor {
 
     private val connectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -102,14 +103,31 @@ class NetworkMonitorImpl(
 
     private fun computeNetworkInfo(): NetworkInfo {
         // network & capabilities or disconnected
-        val network = connectivityManager.activeNetwork ?: return NetworkInfo.Disconnected
-        val caps =
+        var network = connectivityManager.activeNetwork ?: return NetworkInfo.Disconnected
+        var caps =
             connectivityManager.getNetworkCapabilities(network) ?: return NetworkInfo.Disconnected
+
+        // in case phone has an active VPN (like Tailscale, i.e.)
+        if (caps.hasTransport(TRANSPORT_VPN)) {
+            // check if there is a real, active Wi-Fi network running in parallel on the system
+            @Suppress("DEPRECATION")
+            val realWifiNetwork = connectivityManager.allNetworks.firstOrNull { net ->
+                val c = connectivityManager.getNetworkCapabilities(net)
+                c != null && c.hasTransport(TRANSPORT_WIFI) && net != network
+            }
+
+            // If we find the physical Wi-Fi network, we replace the tunnel network with the real one
+            if (realWifiNetwork != null) {
+                network = realWifiNetwork
+                caps = connectivityManager.getNetworkCapabilities(realWifiNetwork)
+                    ?: return NetworkInfo.Disconnected
+            }
+        }
 
         return when {
             !caps.hasTransport(TRANSPORT_WIFI) -> NetworkInfo.Disconnected
             caps.hasCapability(NET_CAPABILITY_VALIDATED) -> computeSubnet(network)
-            else -> NetworkInfo.Connecting  // twilight zone
+            else -> NetworkInfo.Connecting  // twilight zone (connecting...)
         }
     }
 
@@ -120,7 +138,8 @@ class NetworkMonitorImpl(
             ?.linkAddresses
             ?.map { it.address }
             ?.filterIsInstance<Inet4Address>()
-            ?.firstOrNull { !it.isLoopbackAddress }
+            ?.filter { !it.isLoopbackAddress }
+            ?.maxByOrNull { ip -> calculateScore(ip.hostAddress!!) }
             ?: return NetworkInfo.Disconnected
 
         val subnet = ipv4.hostAddress?.substringBeforeLast(".")
@@ -131,7 +150,37 @@ class NetworkMonitorImpl(
             else
                 subnet
 
-        // here we have a value, so no problem with !!
         return NetworkInfo.Local(effectiveSubnet!!)
     }
+
+    // Gives higher scores to home physical interfaces
+    private fun calculateScore(ip: String): Int {
+        return when {
+            // Absolute exclusion of Tailscale and CGNAT for mobile operators (Minimum score)
+            ip.startsWith("100.") -> -100
+
+            // The APIPA autoconfiguration range (when Windows/Android DHCP fails, 169.254.x.x)
+            ip.startsWith("169.254") -> -50
+
+            // TOP PRIORITY: Home networks par excellence (Movistar, Vodafone, Digi routers, etc.)
+            ip.startsWith("192.168.") -> 100
+
+            // HIGH PRIORITY: Subnets 172.16.x.x to 172.31.x.x (Very common on advanced routers and Docker)
+            isRangeClassB(ip) -> 80
+
+            // MEDIUM PRIORITY: Range 10.x.x.x (Sometimes used by corporate VPNs, but also by Apple/enterprise routers)
+            ip.startsWith("10.") -> 50
+
+            // Any other IP
+            else -> 0
+        }
+    }
+
+    private fun isRangeClassB(ip: String): Boolean {
+        val parts = ip.split(".")
+        if (parts.size < 2) return false
+        val secondOctet = parts[1].toIntOrNull() ?: return false
+        return parts[0] == "172" && secondOctet in 16..31
+    }
+
 }
